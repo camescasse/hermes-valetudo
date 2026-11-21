@@ -6,7 +6,8 @@ STATUS = {
         "Get the current state of the Valetudo robot vacuum: status (docked, cleaning, "
         "returning, error and so on), battery level, fan speed, water usage and operation "
         "mode presets, dock status, attachments, dock components, consumables, statistics "
-        "of the current or last clean, and unread robot events such as errors. "
+        "of the current or last clean, and unread robot events such as errors. The robot state "
+        "is under \"state\"; state.error holds the robot error message when status is error. "
         "Use this before you control the robot and to answer questions about it."
     ),
     "parameters": {"type": "object", "properties": {}},
@@ -47,7 +48,7 @@ CLEAN_ROOMS = {
             "iterations": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Number of cleaning passes for each room. Default 1. valetudo_rooms gives the maximum.",
+                "description": "Number of cleaning passes for each room. Default: the robot minimum, normally 1. valetudo_rooms gives the range.",
             },
         },
     },

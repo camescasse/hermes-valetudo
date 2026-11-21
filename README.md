@@ -26,7 +26,7 @@ The plugin calls a fixed set of endpoints only. It cannot:
 - change Wi-Fi, MQTT or other Valetudo settings
 - turn off obstacle avoidance or other robot settings
 
-The plugin does not follow HTTP redirects. It accepts only room names and segment IDs that the robot reports. It refuses presets and pass counts that the robot does not support.
+The plugin connects directly to the robot. It ignores proxy settings and does not follow HTTP redirects. It accepts only room names and segment IDs that the robot reports. It refuses presets and pass counts that the robot does not support.
 
 ## Install
 
@@ -58,7 +58,7 @@ The plugin uses only the Python standard library.
 
 ## Disclosure
 
-- **Network:** the plugin sends HTTP requests only to `VALETUDO_URL`. It does not follow redirects. It sends no telemetry.
+- **Network:** the plugin sends HTTP requests only to `VALETUDO_URL`. It connects directly and ignores `http_proxy` and `https_proxy`. It does not follow redirects. It sends no telemetry.
 - **Physical device:** the tools move a robot in your home. Hermes calls them with no confirmation step.
 - **Credentials:** the plugin reads `VALETUDO_URL`, `VALETUDO_USERNAME` and `VALETUDO_PASSWORD` through Hermes. It stores nothing.
 - **Clear text:** Valetudo serves plain `http://`. Basic auth over `http://` sends the password unencrypted on your network.

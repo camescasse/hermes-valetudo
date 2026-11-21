@@ -99,6 +99,9 @@ def _headers() -> Dict[str, str]:
 # --- HTTP ------------------------------------------------------------------------------------
 
 
+REDIRECT_CODES = {300, 301, 302, 303, 307, 308}
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect, so that a request cannot leave the fixed endpoint set."""
 
@@ -106,15 +109,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+def _opener() -> urllib.request.OpenerDirector:
+    # ProxyHandler({}) ignores http_proxy and https_proxy: requests go directly to the robot.
+    return urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
 def _error_detail(exc: urllib.error.HTTPError) -> str:
-    with exc:
-        body = exc.read(MAX_ERROR_DETAIL + 1).decode("utf-8", "replace").strip()
+    try:
+        with exc:
+            body = exc.read(MAX_ERROR_DETAIL + 1).decode("utf-8", "replace").strip()
+    except (OSError, http.client.HTTPException, ValueError):
+        return ""
     if not body or body.startswith("<") or len(body) > MAX_ERROR_DETAIL:
         return ""
     return ": " + " ".join(body.split())
+
+
+def _possibly_ran(method: str) -> str:
+    if method == "GET":
+        return ""
+    return " The command possibly ran. Call valetudo_status before you send it again."
 
 
 def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
@@ -126,10 +140,10 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(base + API + path, data=data, headers=headers, method=method)
     try:
-        with _opener.open(request, timeout=TIMEOUT) as response:
+        with _opener().open(request, timeout=TIMEOUT) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        if 300 <= exc.code < 400:
+        if exc.code in REDIRECT_CODES:
             exc.close()
             raise ValetudoError(
                 f"Valetudo answered with a redirect (HTTP {exc.code}). The plugin does not follow "
@@ -144,13 +158,13 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
     except (TimeoutError, urllib.error.URLError) as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
-            message = f"Valetudo at {base} did not answer in {TIMEOUT} s."
-            if method != "GET":
-                message += " The command possibly ran. Call valetudo_status before you send it again."
-            raise ValetudoError(message) from None
+            raise ValetudoError(f"Valetudo at {base} did not answer in {TIMEOUT} s.{_possibly_ran(method)}") from None
         raise ValetudoError(f"Cannot reach Valetudo at {base}: {reason}") from None
     except (http.client.HTTPException, OSError) as exc:
-        raise ValetudoError(f"Connection to Valetudo at {base} failed: {type(exc).__name__}") from None
+        # The connection closed after the request was sent, so the robot possibly received it.
+        raise ValetudoError(
+            f"Connection to Valetudo at {base} failed: {type(exc).__name__}.{_possibly_ran(method)}"
+        ) from None
     if not raw:
         return None
     try:
@@ -183,12 +197,22 @@ def _capability_path(capability: str, suffix: str = "") -> str:
     return f"/robot/capabilities/{capability}{suffix}"
 
 
+def _get_list(path: str) -> list:
+    data = _request("GET", path)
+    if not isinstance(data, list):
+        raise ValetudoError(f"Valetudo returned an unexpected response for GET {path}")
+    return data
+
+
 def _segments() -> List[dict]:
     _require("MapSegmentationCapability")
-    segments = _request("GET", _capability_path("MapSegmentationCapability"))
-    if not isinstance(segments, list):
-        raise ValetudoError("Valetudo returned an unexpected segment list")
-    return [{"id": str(s.get("id")), "name": s.get("name")} for s in segments if isinstance(s, dict)]
+    out = []
+    for s in _get_list(_capability_path("MapSegmentationCapability")):
+        if not isinstance(s, dict) or s.get("id") is None:
+            continue
+        name = s.get("name")
+        out.append({"id": str(s["id"]), "name": name.strip() if isinstance(name, str) and name.strip() else None})
+    return out
 
 
 # --- state formatting ---------------------------------------------------------------------
@@ -257,7 +281,7 @@ def _summarize_consumables(items: Any) -> List[dict]:
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
-        remaining = item.get("remaining") or {}
+        remaining = item.get("remaining") if isinstance(item.get("remaining"), dict) else {}
         name = item.get("type") or "consumable"
         if item.get("subType") not in (None, "none"):
             name = f"{name}_{item['subType']}"
@@ -286,17 +310,15 @@ def _string_list(args: dict, key: str) -> List[str]:
     value = args.get(key)
     if value is None:
         return []
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list) or not all(isinstance(v, (str, int)) and not isinstance(v, bool) for v in value):
-        raise ValetudoError(f"{key} must be a list of strings")
-    return [str(v).strip() for v in value if str(v).strip()]
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValetudoError(f"{key} must be a list of non-empty strings")
+    return [v.strip() for v in value]
 
 
 def _iterations(args: dict, low: int, high: int) -> int:
-    if "iterations" not in args or args["iterations"] is None:
-        return 1
-    value = args["iterations"]
+    value = args.get("iterations")
+    if value is None:
+        value = low  # the robot minimum, normally 1
     if isinstance(value, bool) or not isinstance(value, int):
         if isinstance(value, float) and value.is_integer():
             value = int(value)
@@ -327,36 +349,51 @@ def _run(fn: Callable[[dict], str], args: Any) -> str:
         return _error(f"Unexpected error: {type(exc).__name__}")
 
 
+def _events() -> Any:
+    events = _request("GET", "/events")
+    if not isinstance(events, (list, dict)):
+        raise ValetudoError("Valetudo returned an unexpected response for GET /events")
+    return _summarize_events(events)
+
+
 def _status(args: dict) -> str:
     caps = _capabilities(refresh=True)
     robot = _request("GET", "/robot")
     robot = robot if isinstance(robot, dict) else {}
+    # The robot state goes under "state": Hermes treats a top-level "error" key, or a
+    # top-level "status" of "error", as a failed tool call.
     result: Dict[str, Any] = {
         "robot": f"{robot.get('manufacturer', '')} {robot.get('modelName', '')}".strip(),
+        "state": _summarize_attributes(_get_list("/robot/state/attributes")),
     }
-    result.update(_summarize_attributes(_request("GET", "/robot/state/attributes")))
 
     # The optional sections must not hide the main state when one of them fails.
     sections: List[Tuple[str, Callable[[], Any]]] = []
     if "CurrentStatisticsCapability" in caps:
         sections.append(("current_statistics", lambda: _summarize_statistics(
-            _request("GET", _capability_path("CurrentStatisticsCapability")))))
+            _get_list(_capability_path("CurrentStatisticsCapability")))))
     if "ConsumableMonitoringCapability" in caps:
         sections.append(("consumables", lambda: _summarize_consumables(
-            _request("GET", _capability_path("ConsumableMonitoringCapability")))))
-    sections.append(("unread_events", lambda: _summarize_events(_request("GET", "/events"))))
+            _get_list(_capability_path("ConsumableMonitoringCapability")))))
+    sections.append(("unread_events", _events))
     for name, read in sections:
         try:
             result[name] = read()
         except ValetudoError as exc:
-            result[f"{name}_error"] = str(exc)
+            result[f"{name}_problem"] = str(exc)
+        except Exception as exc:
+            result[f"{name}_problem"] = f"Unexpected response: {type(exc).__name__}"
     return _ok(**result)
 
 
 def _iteration_range() -> Tuple[int, int]:
     props = _request("GET", _capability_path("MapSegmentationCapability", "/properties"))
-    count = (props if isinstance(props, dict) else {}).get("iterationCount") or {}
-    return int(count.get("min", 1)), int(count.get("max", 1))
+    count = (props if isinstance(props, dict) else {}).get("iterationCount")
+    count = count if isinstance(count, dict) else {}
+    low, high = count.get("min"), count.get("max")
+    low = low if isinstance(low, int) and not isinstance(low, bool) and low >= 1 else 1
+    high = high if isinstance(high, int) and not isinstance(high, bool) and high >= low else low
+    return low, high
 
 
 def _rooms(args: dict) -> str:
