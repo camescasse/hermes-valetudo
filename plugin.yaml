@@ -1,0 +1,39 @@
+name: valetudo-robot
+label: Valetudo
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+author: camescasse
+license: MIT
+homepage: https://github.com/camescasse/hermes-valetudo
+tags: [valetudo, robot-vacuum, smart-home]
+description: >
+  Control a robot vacuum that runs Valetudo, through its local REST API.
+  Read the robot state, list the rooms, clean rooms by name, start, stop,
+  pause, dock or locate the robot, set the fan, water and mode presets,
+  and start dock actions. The plugin calls a fixed set of endpoints only:
+  it cannot reset the map, edit no-go zones or change Wi-Fi settings.
+requires_hermes: ">=0.22.6"
+provides_tools:
+  - valetudo_status
+  - valetudo_rooms
+  - valetudo_clean_rooms
+  - valetudo_control
+  - valetudo_set_preset
+  - valetudo_dock
+provides_hooks: []
+requires_env:
+  - name: VALETUDO_URL
+    description: "Base URL of the Valetudo web interface, for example http://192.168.1.50"
+    secret: false
+config_schema:
+  username:
+    type: secret
+    env: VALETUDO_USERNAME
+    label: "Username"
+    description: "Valetudo HTTP basic auth username. Leave empty when basic auth is off."
+  password:
+    type: secret
+    env: VALETUDO_PASSWORD
+    label: "Password"
+    description: "Valetudo HTTP basic auth password. Leave empty when basic auth is off."
