@@ -62,7 +62,7 @@ The plugin uses only the Python standard library.
 - **Physical device:** the tools move a robot in your home. Hermes calls them with no confirmation step.
 - **Credentials:** the plugin reads `VALETUDO_URL`, `VALETUDO_USERNAME` and `VALETUDO_PASSWORD` through Hermes. It stores nothing.
 - **Clear text:** Valetudo serves plain `http://`. Basic auth over `http://` sends the password unencrypted on your network.
-- **Model provider:** tool results, such as room names and robot state, go to your model provider.
+- **Model provider:** tool results go to your model provider. They contain room names, robot state and, in error messages, the `VALETUDO_URL` address.
 - **Valetudo without auth:** Valetudo has no login by default. Any device on your network can control the robot. Turn on basic auth in Valetudo to prevent this.
 
 ## Development

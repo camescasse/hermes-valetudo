@@ -74,6 +74,10 @@ def _base_url() -> str:
         )
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValetudoError("VALETUDO_URL must be an http:// or https:// URL")
+    try:
+        parsed.hostname.encode("idna")
+    except UnicodeError:
+        raise ValetudoError("VALETUDO_URL is not a valid URL") from None
     path = parsed.path.rstrip("/")
     if path.endswith(API):
         path = path[: -len(API)]
@@ -100,6 +104,10 @@ def _headers() -> Dict[str, str]:
 
 
 REDIRECT_CODES = {300, 301, 302, 303, 307, 308}
+# A proxy in front of Valetudo can return these after it sent the request to the robot.
+GATEWAY_CODES = {502, 504}
+# These errors occur after the connection opened, so the robot possibly received the request.
+SEND_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -114,13 +122,25 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
+def _secrets_in(text: str) -> bool:
+    """Return True when text holds the credentials or the Authorization header."""
+    folded = text.casefold()
+    if "authorization" in folded or "basic " in folded:
+        return True
+    user = get_secret("VALETUDO_USERNAME", "") or ""
+    password = get_secret("VALETUDO_PASSWORD", "") or ""
+    token = base64.b64encode(f"{user}:{password}".encode()).decode() if user or password else ""
+    return any(secret and secret in text for secret in (password, token))
+
+
 def _error_detail(exc: urllib.error.HTTPError) -> str:
     try:
         with exc:
-            body = exc.read(MAX_ERROR_DETAIL + 1).decode("utf-8", "replace").strip()
+            # A UTF-8 character has at most 4 bytes: read enough bytes to count characters.
+            body = exc.read(4 * MAX_ERROR_DETAIL + 4).decode("utf-8", "replace").strip()
     except (OSError, http.client.HTTPException, ValueError):
         return ""
-    if not body or body.startswith("<") or len(body) > MAX_ERROR_DETAIL:
+    if not body or len(body) > MAX_ERROR_DETAIL or "<" in body or "\ufffd" in body or _secrets_in(body):
         return ""
     return ": " + " ".join(body.split())
 
@@ -142,6 +162,7 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
     try:
         with _opener().open(request, timeout=TIMEOUT) as response:
             raw = response.read()
+            content_type = response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
         if exc.code in REDIRECT_CODES:
             exc.close()
@@ -154,12 +175,20 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
             raise ValetudoError(
                 "Valetudo refused the credentials (HTTP 401). Set VALETUDO_USERNAME and VALETUDO_PASSWORD."
             ) from None
-        raise ValetudoError(f"Valetudo returned HTTP {exc.code} for {method} {path}{_error_detail(exc)}") from None
-    except (TimeoutError, urllib.error.URLError) as exc:
-        reason = getattr(exc, "reason", exc)
-        if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
-            raise ValetudoError(f"Valetudo at {base} did not answer in {TIMEOUT} s.{_possibly_ran(method)}") from None
-        raise ValetudoError(f"Cannot reach Valetudo at {base}: {reason}") from None
+        hint = _possibly_ran(method) if exc.code in GATEWAY_CODES else ""
+        raise ValetudoError(f"Valetudo returned HTTP {exc.code} for {method} {path}{_error_detail(exc)}{hint}") from None
+    except urllib.error.URLError as exc:
+        # urllib wraps the errors of the connect and send steps in URLError.
+        if isinstance(exc.reason, SEND_ERRORS):
+            raise ValetudoError(
+                f"Connection to Valetudo at {base} failed: {type(exc.reason).__name__}.{_possibly_ran(method)}"
+            ) from None
+        if isinstance(exc.reason, TimeoutError):
+            raise ValetudoError(f"Cannot reach Valetudo at {base}: no connection in {TIMEOUT} s") from None
+        raise ValetudoError(f"Cannot reach Valetudo at {base}: {exc.reason}") from None
+    except TimeoutError:
+        # The request went out, but the response did not arrive.
+        raise ValetudoError(f"Valetudo at {base} did not answer in {TIMEOUT} s.{_possibly_ran(method)}") from None
     except (http.client.HTTPException, OSError) as exc:
         # The connection closed after the request was sent, so the robot possibly received it.
         raise ValetudoError(
@@ -167,10 +196,17 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
         ) from None
     if not raw:
         return None
+    text = raw.decode("utf-8", "replace")
+    if "html" in content_type.casefold() or text.lstrip().startswith("<"):
+        # For example a login page of a reverse proxy: the robot did not get the request.
+        raise ValetudoError(
+            f"VALETUDO_URL returned an HTML page for {method} {path}, not a Valetudo API response. "
+            "Set VALETUDO_URL to the address of the Valetudo web interface."
+        )
     try:
         return json.loads(raw)
     except ValueError:
-        return raw.decode("utf-8", "replace")
+        return text
 
 
 def _capabilities(refresh: bool = False) -> List[str]:
@@ -208,10 +244,10 @@ def _segments() -> List[dict]:
     _require("MapSegmentationCapability")
     out = []
     for s in _get_list(_capability_path("MapSegmentationCapability")):
-        if not isinstance(s, dict) or s.get("id") is None:
+        if not isinstance(s, dict) or s.get("id") is None or isinstance(s["id"], bool) or not str(s["id"]).strip():
             continue
         name = s.get("name")
-        out.append({"id": str(s["id"]), "name": name.strip() if isinstance(name, str) and name.strip() else None})
+        out.append({"id": str(s["id"]).strip(), "name": name.strip() if isinstance(name, str) and name.strip() else None})
     return out
 
 
@@ -243,15 +279,16 @@ def _summarize_attributes(attributes: Any) -> Dict[str, Any]:
             out["battery_percent"] = attr.get("level")
             if attr.get("flag") not in (None, "none"):
                 out["battery_flag"] = attr.get("flag")
-        elif kind == "PresetSelectionStateAttribute":
-            name = PRESET_ATTRIBUTE_NAMES.get(attr.get("type"), attr.get("type"))
-            presets[name] = attr.get("value")
         elif kind == "DockStatusStateAttribute":
             out["dock_status"] = attr.get("value")
+        elif not isinstance(attr.get("type"), str):
+            continue
+        elif kind == "PresetSelectionStateAttribute":
+            presets[PRESET_ATTRIBUTE_NAMES.get(attr["type"], attr["type"])] = attr.get("value")
         elif kind == "AttachmentStateAttribute":
-            attachments[attr.get("type")] = attr.get("attached")
+            attachments[attr["type"]] = attr.get("attached")
         elif kind == "DockComponentStateAttribute":
-            dock_components[attr.get("type")] = attr.get("value")
+            dock_components[attr["type"]] = attr.get("value")
     if presets:
         out["presets"] = presets
     if attachments:
@@ -261,44 +298,52 @@ def _summarize_attributes(attributes: Any) -> Dict[str, Any]:
     return out
 
 
+def _items(data: Any, what: str) -> List[dict]:
+    """Return the entries of an optional status section, or raise when the shape is wrong."""
+    if isinstance(data, dict):
+        data = list(data.values())
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ValetudoError(f"Valetudo returned unexpected {what} data")
+    return data
+
+
 def _summarize_statistics(points: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    for point in points if isinstance(points, list) else []:
-        if not isinstance(point, dict):
-            continue
+    for point in _items(points, "statistics"):
         value = point.get("value")
         if point.get("type") == "time" and isinstance(value, (int, float)):
             out["duration_minutes"] = round(value / 60, 1)
         elif point.get("type") == "area" and isinstance(value, (int, float)):
             out["area_m2"] = round(value / 10000, 1)
-        elif point.get("type"):
+        elif isinstance(point.get("type"), str):
             out[point["type"]] = value
     return out
 
 
 def _summarize_consumables(items: Any) -> List[dict]:
     out = []
-    for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict):
-            continue
+    for item in _items(items, "consumable"):
         remaining = item.get("remaining") if isinstance(item.get("remaining"), dict) else {}
-        name = item.get("type") or "consumable"
-        if item.get("subType") not in (None, "none"):
+        name = item.get("type") if isinstance(item.get("type"), str) else "consumable"
+        if isinstance(item.get("subType"), str) and item["subType"] != "none":
             name = f"{name}_{item['subType']}"
         out.append({"consumable": name, "remaining": remaining.get("value"), "unit": remaining.get("unit")})
     return out
 
 
 def _summarize_events(events: Any) -> List[dict]:
-    if isinstance(events, dict):
-        events = list(events.values())
+    items = _items(events, "event")
+    if not all(isinstance(event.get("__class"), str) for event in items):
+        raise ValetudoError("Valetudo returned unexpected event data")
     out = []
-    for event in events if isinstance(events, list) else []:
-        if not isinstance(event, dict) or event.get("processed"):
+    for event in items:
+        if event.get("processed"):
             continue
-        entry = {"event": str(event.get("__class", "")).replace("ValetudoEvent", ""), "time": event.get("timestamp")}
-        if event.get("message"):
-            entry["message"] = event["message"]
+        entry = {"event": event["__class"].replace("ValetudoEvent", ""), "time": event.get("timestamp")}
+        # For example ConsumableDepletedValetudoEvent: type and subType name the consumable.
+        for key in ("message", "type", "subType"):
+            if isinstance(event.get(key), str) and event[key] not in ("", "none"):
+                entry[key] = event[key]
         out.append(entry)
     return out
 
@@ -319,11 +364,9 @@ def _iterations(args: dict, low: int, high: int) -> int:
     value = args.get("iterations")
     if value is None:
         value = low  # the robot minimum, normally 1
-    if isinstance(value, bool) or not isinstance(value, int):
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        else:
-            raise ValetudoError("iterations must be a whole number")
+    value = _whole(value)
+    if value is None:
+        raise ValetudoError("iterations must be a whole number")
     if not low <= value <= high:
         raise ValetudoError(f"iterations must be from {low} to {high} on this robot")
     return value
@@ -350,25 +393,24 @@ def _run(fn: Callable[[dict], str], args: Any) -> str:
 
 
 def _events() -> Any:
-    events = _request("GET", "/events")
-    if not isinstance(events, (list, dict)):
-        raise ValetudoError("Valetudo returned an unexpected response for GET /events")
-    return _summarize_events(events)
+    return _summarize_events(_request("GET", "/events"))
+
+
+def _robot_label() -> str:
+    robot = _request("GET", "/robot")
+    robot = robot if isinstance(robot, dict) else {}
+    parts = [robot.get(key) for key in ("manufacturer", "modelName")]
+    return " ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
 
 
 def _status(args: dict) -> str:
     caps = _capabilities(refresh=True)
-    robot = _request("GET", "/robot")
-    robot = robot if isinstance(robot, dict) else {}
     # The robot state goes under "state": Hermes treats a top-level "error" key, or a
     # top-level "status" of "error", as a failed tool call.
-    result: Dict[str, Any] = {
-        "robot": f"{robot.get('manufacturer', '')} {robot.get('modelName', '')}".strip(),
-        "state": _summarize_attributes(_get_list("/robot/state/attributes")),
-    }
+    result: Dict[str, Any] = {"state": _summarize_attributes(_get_list("/robot/state/attributes"))}
 
     # The optional sections must not hide the main state when one of them fails.
-    sections: List[Tuple[str, Callable[[], Any]]] = []
+    sections: List[Tuple[str, Callable[[], Any]]] = [("robot", _robot_label)]
     if "CurrentStatisticsCapability" in caps:
         sections.append(("current_statistics", lambda: _summarize_statistics(
             _get_list(_capability_path("CurrentStatisticsCapability")))))
@@ -386,19 +428,33 @@ def _status(args: dict) -> str:
     return _ok(**result)
 
 
+def _whole(value: Any) -> Optional[int]:
+    """Return value as an int when it is a whole JSON number, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
 def _iteration_range() -> Tuple[int, int]:
     props = _request("GET", _capability_path("MapSegmentationCapability", "/properties"))
     count = (props if isinstance(props, dict) else {}).get("iterationCount")
     count = count if isinstance(count, dict) else {}
-    low, high = count.get("min"), count.get("max")
-    low = low if isinstance(low, int) and not isinstance(low, bool) and low >= 1 else 1
-    high = high if isinstance(high, int) and not isinstance(high, bool) and high >= low else low
+    low, high = _whole(count.get("min")), _whole(count.get("max"))
+    low = 1 if low is None else low
+    high = low if high is None else high
+    if low < 1 or high < low:
+        raise ValetudoError(f"The robot reports a pass range that is not valid ({low} to {high})")
     return low, high
 
 
 def _rooms(args: dict) -> str:
     segments = _segments()
-    low, high = _iteration_range()
+    try:
+        low, high = _iteration_range()
+    except ValetudoError as exc:
+        return _ok(rooms=segments, iterations_problem=str(exc))
     return _ok(rooms=segments, iterations={"min": low, "max": high})
 
 

@@ -17,6 +17,8 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -92,6 +94,7 @@ class FakeValetudo(BaseHTTPRequestHandler):
     put_delay: float = 0.0
     put_headers: dict = {}
     put_body: str = "Invalid request body"
+    put_ok_body: str = "OK"
     put_drop: bool = False
 
     def log_message(self, *args):
@@ -140,7 +143,7 @@ class FakeValetudo(BaseHTTPRequestHandler):
             time.sleep(FakeValetudo.put_delay)
         if FakeValetudo.put_status != 200:
             return self._send(FakeValetudo.put_status, FakeValetudo.put_body, FakeValetudo.put_headers)
-        self._send(200, "OK")
+        self._send(200, FakeValetudo.put_ok_body, FakeValetudo.put_headers)
 
 
 class ToolTests(unittest.TestCase):
@@ -165,6 +168,7 @@ class ToolTests(unittest.TestCase):
         FakeValetudo.put_delay = 0.0
         FakeValetudo.put_headers = {}
         FakeValetudo.put_body = "Invalid request body"
+        FakeValetudo.put_ok_body = "OK"
         FakeValetudo.put_drop = False
         tools._capability_cache.clear()
         self._timeout = tools.TIMEOUT
@@ -197,7 +201,7 @@ class ToolTests(unittest.TestCase):
         for raw in ("192.168.1.5", "http://192.168.1.5/", "http://192.168.1.5/api/v2"):
             SECRETS["VALETUDO_URL"] = raw
             self.assertEqual(tools._base_url(), "http://192.168.1.5")
-        for raw in ("ftp://x", "http://host:port"):
+        for raw in ("ftp://x", "http://host:port", "http://a..b"):
             SECRETS["VALETUDO_URL"] = raw
             self.assertRaises(tools.ValetudoError, tools._base_url)
 
@@ -253,7 +257,41 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["state"]["status"], "docked")
         self.assertEqual(result["consumables"], [{"consumable": "brush", "remaining": None, "unit": None}])
         self.assertIn("unexpected response", result["current_statistics_problem"])
-        self.assertIn("unexpected response", result["unread_events_problem"])
+        self.assertIn("unexpected event data", result["unread_events_problem"])
+
+    def test_status_bad_items_are_problems_not_empty_lists(self):
+        FakeValetudo.routes["/api/v2/events"] = {"error": "service unavailable"}
+        FakeValetudo.routes[f"{CAP}/CurrentStatisticsCapability"] = [False]
+        FakeValetudo.routes[f"{CAP}/ConsumableMonitoringCapability"] = ["brush"]
+        result = self.call(tools.status)
+        for section in ("unread_events", "current_statistics", "consumables"):
+            self.assertNotIn(section, result)
+            self.assertIn("unexpected", result[f"{section}_problem"])
+
+    def test_status_robot_label_failure_keeps_state(self):
+        FakeValetudo.routes["/api/v2/robot"] = (500, "boom", None)
+        result = self.call(tools.status)
+        self.assertEqual(result["state"]["status"], "docked")
+        self.assertIn("HTTP 500", result["robot_problem"])
+        FakeValetudo.routes["/api/v2/robot"] = {"manufacturer": None, "modelName": "X"}
+        self.assertEqual(self.call(tools.status)["robot"], "X")
+
+    def test_status_attribute_with_bad_type(self):
+        FakeValetudo.routes["/api/v2/robot/state/attributes"].append(
+            {"__class": "PresetSelectionStateAttribute", "type": ["fan_speed"], "value": "max"})
+        result = self.call(tools.status)
+        self.assertEqual(result["state"]["presets"], {"fan_speed": "medium", "water_usage": "high"})
+
+    def test_status_robot_error_without_message(self):
+        FakeValetudo.routes["/api/v2/robot/state/attributes"] = [
+            {"__class": "StatusStateAttribute", "value": "error", "error": {"severity": {"kind": "unknown"}}}]
+        self.assertIn("unknown", self.call(tools.status)["state"]["error"])
+
+    def test_status_consumable_event_names_the_consumable(self):
+        FakeValetudo.routes["/api/v2/events"] = [{"__class": "ConsumableDepletedValetudoEvent", "timestamp": "t",
+                                                  "processed": False, "type": "filter", "subType": "main"}]
+        self.assertEqual(self.call(tools.status)["unread_events"],
+                         [{"event": "ConsumableDepleted", "time": "t", "type": "filter", "subType": "main"}])
 
     # --- rooms and cleaning ---
 
@@ -280,10 +318,36 @@ class ToolTests(unittest.TestCase):
         self.assertEqual([c[1]["segment_ids"] for c in FakeValetudo.calls], [["1"], ["2"]])
 
     def test_clean_rooms_iterations_default_and_float(self):
+        props = f"{CAP}/MapSegmentationCapability/properties"
         self.call(tools.clean_rooms, {"rooms": ["Kitchen"], "iterations": 2.0})
-        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability/properties"] = {"iterationCount": {"min": 2, "max": 3}}
+        FakeValetudo.routes[props] = {"iterationCount": {"min": 2, "max": 3}}
         self.call(tools.clean_rooms, {"rooms": ["Kitchen"]})
-        self.assertEqual([c[1]["iterations"] for c in FakeValetudo.calls], [2, 2])
+        FakeValetudo.routes[props] = {"iterationCount": {"min": 2.0, "max": 3.0}}
+        self.call(tools.clean_rooms, {"rooms": ["Kitchen"]})
+        self.assertEqual([c[1]["iterations"] for c in FakeValetudo.calls], [2, 2, 2])
+
+    def test_iteration_range_fallback(self):
+        props = f"{CAP}/MapSegmentationCapability/properties"
+        for value in ({}, {"iterationCount": "x"}, {"iterationCount": {"min": True, "max": "3"}}, []):
+            with self.subTest(value=value):
+                FakeValetudo.routes[props] = value
+                self.assertEqual(self.call(tools.rooms)["iterations"], {"min": 1, "max": 1})
+
+    def test_invalid_iteration_range_sends_nothing(self):
+        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability/properties"] = {"iterationCount": {"min": 2, "max": 1}}
+        self.assert_error(self.call(tools.clean_rooms, {"rooms": ["Kitchen"]}), "not valid (2 to 1)")
+        result = self.call(tools.rooms)
+        self.assertEqual(len(result["rooms"]), 3)
+        self.assertIn("not valid", result["iterations_problem"])
+        self.assertEqual(FakeValetudo.calls, [])
+
+    def test_blank_segment_ids_are_skipped(self):
+        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability"] = [
+            {"id": "", "name": "Office"}, {"id": " ", "name": "Hall"}, {"id": True, "name": "Bad"}, {"id": 1, "name": "Kitchen"}]
+        self.assertEqual(self.call(tools.rooms)["rooms"], [{"id": "1", "name": "Kitchen"}])
+        self.assert_error(self.call(tools.clean_rooms, {"rooms": ["Office"]}), "Unknown room name")
+        self.call(tools.clean_rooms, {"segment_ids": [" 1 "]})
+        self.assertEqual(FakeValetudo.calls[0][1]["segment_ids"], ["1"])
 
     def test_robot_room_name_with_spaces(self):
         FakeValetudo.routes[f"{CAP}/MapSegmentationCapability"] = [{"id": "1", "name": "Kitchen "}, {"name": "no id"}]
@@ -353,8 +417,10 @@ class ToolTests(unittest.TestCase):
         SECRETS.update(VALETUDO_USERNAME="user", VALETUDO_PASSWORD="pass")
         self.assertTrue(self.call(tools.status)["ok"])
 
+    REDIRECTS = (300, 301, 302, 303, 307, 308)  # independent of tools.REDIRECT_CODES
+
     def test_get_redirect_is_not_followed(self):
-        for code in sorted(tools.REDIRECT_CODES):
+        for code in self.REDIRECTS:
             with self.subTest(code=code):
                 FakeValetudo.requests = []
                 tools._capability_cache.clear()
@@ -363,11 +429,22 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(FakeValetudo.requests, [("GET", CAP)])
 
     def test_put_redirect_is_not_followed(self):
-        FakeValetudo.put_status = 307
         FakeValetudo.put_headers = {"Location": "/api/v2/robot/capabilities/MapResetCapability"}
-        self.assert_error(self.call(tools.control, {"action": "home"}), "redirect")
-        self.assertEqual([r for r in FakeValetudo.requests if r[0] == "PUT"],
-                         [("PUT", f"{CAP}/BasicControlCapability")])
+        for code in self.REDIRECTS:
+            with self.subTest(code=code):
+                FakeValetudo.requests = []
+                FakeValetudo.put_status = code
+                self.assert_error(self.call(tools.control, {"action": "home"}), "redirect")
+                self.assertEqual([r for r in FakeValetudo.requests if r[0] == "PUT"],
+                                 [("PUT", f"{CAP}/BasicControlCapability")])
+
+    def test_304_and_305_are_not_redirects(self):
+        for code in (304, 305):
+            with self.subTest(code=code):
+                FakeValetudo.put_status = code
+                result = self.call(tools.control, {"action": "home"})
+                self.assert_error(result, f"HTTP {code} for PUT")
+                self.assertNotIn("redirect", result["error"])
 
     def test_proxy_settings_are_ignored(self):
         proxy_hits = []
@@ -384,9 +461,11 @@ class ToolTests(unittest.TestCase):
 
         proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        saved = {k: os.environ.get(k) for k in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY")}
+        names = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+        saved = {k: os.environ.get(k) for k in names + ("no_proxy", "NO_PROXY")}
         try:
-            os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{proxy.server_port}"
+            for name in names:
+                os.environ[name] = f"http://127.0.0.1:{proxy.server_port}"
             os.environ.pop("no_proxy", None)
             os.environ.pop("NO_PROXY", None)
             self.assertTrue(self.call(tools.status)["ok"])
@@ -407,6 +486,70 @@ class ToolTests(unittest.TestCase):
         FakeValetudo.routes["/api/v2/robot/state/attributes"] = None  # the fake server answers with an HTML 404 page
         result = self.call(tools.status)
         self.assertTrue(result["error"].endswith("HTTP 404 for GET /robot/state/attributes"), result)
+
+    def test_error_body_with_credentials_is_dropped(self):
+        SECRETS.update(VALETUDO_USERNAME="user", VALETUDO_PASSWORD="s3cret")
+        token = base64.b64encode(b"user:s3cret").decode()
+        FakeValetudo.put_status = 403
+        for body in (f"Basic {token}", f"authorization: {token}", f"bad {token}", "password s3cret refused"):
+            with self.subTest(body=body):
+                FakeValetudo.put_body = body
+                result = self.call(tools.control, {"action": "home"})
+                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability"), result)
+                self.assertNotIn("s3cret", json.dumps(result))
+                self.assertNotIn(token, json.dumps(result))
+
+    def test_error_body_filter_counts_characters_and_drops_html(self):
+        FakeValetudo.put_status = 400
+        for body in ("é" * 250, "Reason: <b>invalid</b>"):
+            with self.subTest(body=body[:20]):
+                FakeValetudo.put_body = body
+                result = self.call(tools.control, {"action": "home"})
+                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability"), result)
+        FakeValetudo.put_body = "é" * 150
+        self.assertIn("é" * 150, self.call(tools.control, {"action": "home"})["error"])
+
+    def test_error_body_read_failure(self):
+        class Broken:
+            closed = False
+
+            def read(self, *args):
+                raise OSError("reset")
+
+            def close(self):
+                pass
+
+        exc = urllib.error.HTTPError("http://x", 400, "Bad", {}, Broken())
+        self.assertEqual(tools._error_detail(exc), "")
+
+    def test_html_page_is_not_success(self):
+        FakeValetudo.put_ok_body = "<!doctype html><title>Login</title>"
+        self.assert_error(self.call(tools.control, {"action": "home"}), "HTML page")
+        FakeValetudo.put_ok_body = "Login"
+        FakeValetudo.put_headers = {"Content-Type": "text/html; charset=utf-8"}
+        self.assert_error(self.call(tools.control, {"action": "home"}), "HTML page")
+        FakeValetudo.routes[CAP] = (200, "<html>Login</html>", None)
+        tools._capability_cache.clear()
+        self.assert_error(self.call(tools.status), "HTML page")
+
+    def test_gateway_error_on_put_says_state_is_unknown(self):
+        for code in (502, 504):
+            with self.subTest(code=code):
+                FakeValetudo.put_status = code
+                self.assert_error(self.call(tools.control, {"action": "home"}), "possibly ran")
+        FakeValetudo.put_status = 500
+        self.assertNotIn("possibly ran", self.call(tools.control, {"action": "home"})["error"])
+
+    def test_send_error_says_state_is_unknown(self):
+        self.call(tools.control, {"action": "home"})  # fill the capability cache
+        failing = mock.Mock()
+        failing.open.side_effect = urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
+        with mock.patch.object(tools, "_opener", return_value=failing):
+            self.assert_error(self.call(tools.control, {"action": "home"}), "possibly ran")
+            failing.open.side_effect = urllib.error.URLError(TimeoutError("timed out"))
+            result = self.call(tools.control, {"action": "home"})
+            self.assert_error(result, "no connection in")
+            self.assertNotIn("possibly ran", result["error"])
 
     def test_put_timeout_says_state_is_unknown(self):
         tools.TIMEOUT = 0.3
