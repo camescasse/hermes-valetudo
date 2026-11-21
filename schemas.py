@@ -16,8 +16,8 @@ ROOMS = {
     "name": "valetudo_rooms",
     "description": (
         "List the rooms (map segments) of the Valetudo robot vacuum, with their IDs and "
-        "names, and the allowed number of cleaning passes. Use this to find the room names "
-        "before you call valetudo_clean_rooms."
+        "names, and the allowed number of cleaning passes. A room without a name has name null. "
+        "Use this to find the room names or IDs before you call valetudo_clean_rooms."
     ),
     "parameters": {"type": "object", "properties": {}},
 }
@@ -25,9 +25,10 @@ ROOMS = {
 CLEAN_ROOMS = {
     "name": "valetudo_clean_rooms",
     "description": (
-        "Start a clean of one or more rooms with the Valetudo robot vacuum. Give the room "
-        "names as shown by valetudo_rooms (case does not matter). A room without a name "
-        "takes its segment ID. The robot leaves the dock and starts at once. "
+        "Start a clean of one or more rooms with the Valetudo robot vacuum. Give room names in "
+        "rooms (case does not matter), segment IDs in segment_ids, or both. A room without a "
+        "name is available only by its segment ID. Get the names and IDs from valetudo_rooms. "
+        "The robot leaves the dock and starts at once, and it selects the order of the rooms. "
         "The current fan speed, water usage and operation mode presets apply."
     ),
     "parameters": {
@@ -36,16 +37,19 @@ CLEAN_ROOMS = {
             "rooms": {
                 "type": "array",
                 "items": {"type": "string"},
-                "minItems": 1,
-                "description": "Room names or segment IDs, for example [\"Kitchen\", \"Office\"]",
+                "description": "Room names, for example [\"Kitchen\", \"Office\"]",
+            },
+            "segment_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Segment IDs from valetudo_rooms, for example [\"10\"]",
             },
             "iterations": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Number of cleaning passes for each room. Default 1.",
+                "description": "Number of cleaning passes for each room. Default 1. valetudo_rooms gives the maximum.",
             },
         },
-        "required": ["rooms"],
     },
 }
 
@@ -53,7 +57,8 @@ CONTROL = {
     "name": "valetudo_control",
     "description": (
         "Send a basic command to the Valetudo robot vacuum. "
-        "start: clean the full home. stop: stop the current task. pause: pause the current task. "
+        "start: clean the full home, or continue a paused task. stop: stop the current task. "
+        "pause: pause the current task. "
         "home: return to the dock. locate: play a sound so that a person can find the robot."
     ),
     "parameters": {
