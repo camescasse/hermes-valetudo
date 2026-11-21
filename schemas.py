@@ -54,6 +54,24 @@ CLEAN_ROOMS = {
     },
 }
 
+RENAME_ROOM = {
+    "name": "valetudo_rename_room",
+    "description": (
+        "Rename one room (map segment) of the Valetudo robot vacuum. Give the current name in room "
+        "or the segment ID in segment_id, not both. Get them from valetudo_rooms. The robot does not "
+        "move. The result gives the old name, so you can rename the room back. Room names must be unique."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "room": {"type": "string", "description": "Current room name (case does not matter)"},
+            "segment_id": {"type": "string", "description": "Segment ID from valetudo_rooms, for a room without a name"},
+            "new_name": {"type": "string", "maxLength": 32, "description": "New room name, for example \"Living room\""},
+        },
+        "required": ["new_name"],
+    },
+}
+
 CONTROL = {
     "name": "valetudo_control",
     "description": (

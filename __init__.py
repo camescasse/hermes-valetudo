@@ -10,6 +10,7 @@ _TOOLS = (
     (schemas.STATUS, tools.status),
     (schemas.ROOMS, tools.rooms),
     (schemas.CLEAN_ROOMS, tools.clean_rooms),
+    (schemas.RENAME_ROOM, tools.rename_room),
     (schemas.CONTROL, tools.control),
     (schemas.SET_PRESET, tools.set_preset),
     (schemas.DOCK, tools.dock),

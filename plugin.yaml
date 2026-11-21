@@ -9,7 +9,7 @@ homepage: https://github.com/camescasse/hermes-valetudo
 tags: [valetudo, robot-vacuum, smart-home]
 description: >
   Control a robot vacuum that runs Valetudo, through its local REST API.
-  Read the robot state, list the rooms, clean rooms by name, start, stop,
+  Read the robot state, list, clean and rename rooms, start, stop,
   pause, dock or locate the robot, set the fan, water and mode presets,
   and start dock actions. The plugin calls a fixed set of endpoints only:
   it cannot reset the map, edit no-go zones or change Wi-Fi settings.
@@ -18,6 +18,7 @@ provides_tools:
   - valetudo_status
   - valetudo_rooms
   - valetudo_clean_rooms
+  - valetudo_rename_room
   - valetudo_control
   - valetudo_set_preset
   - valetudo_dock

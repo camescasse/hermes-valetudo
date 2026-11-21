@@ -43,6 +43,7 @@ CAPABILITIES = [
     "BasicControlCapability",
     "LocateCapability",
     "MapSegmentationCapability",
+    "MapSegmentRenameCapability",
     "FanSpeedControlCapability",
     "WaterUsageControlCapability",
     "OperationModeControlCapability",
@@ -190,7 +191,7 @@ class ToolTests(unittest.TestCase):
         ctx = types.SimpleNamespace(register_tool=lambda **kw: registered.append(kw["name"]))
         plugin.register(ctx)
         self.assertEqual(registered, ["valetudo_status", "valetudo_rooms", "valetudo_clean_rooms",
-                                      "valetudo_control", "valetudo_set_preset", "valetudo_dock"])
+                                      "valetudo_rename_room", "valetudo_control", "valetudo_set_preset", "valetudo_dock"])
 
     def test_is_configured(self):
         self.assertTrue(tools.is_configured())
@@ -376,6 +377,57 @@ class ToolTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assert_error(self.call(tools.clean_rooms, args), text)
         self.assertEqual(FakeValetudo.calls, [])
+
+    # --- rename ---
+
+    def test_rename_room(self):
+        result = self.call(tools.rename_room, {"room": "kitchen", "new_name": "  Big \t kitchen "})
+        self.assertEqual(result, {"ok": True, "renamed": True, "segment_id": "1",
+                                  "old_name": "Kitchen", "new_name": "Big kitchen"})
+        result = self.call(tools.rename_room, {"segment_id": "10", "new_name": "Hall"})
+        self.assertEqual(result["old_name"], None)
+        rename = f"{CAP}/MapSegmentRenameCapability"
+        self.assertEqual(FakeValetudo.calls, [
+            (rename, {"action": "rename_segment", "segment_id": "1", "name": "Big kitchen"}),
+            (rename, {"action": "rename_segment", "segment_id": "10", "name": "Hall"}),
+        ])
+
+    def test_rename_room_to_same_name_sends_nothing(self):
+        result = self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Kitchen"})
+        self.assertEqual(result, {"ok": True, "renamed": False, "segment_id": "1", "name": "Kitchen"})
+        self.assertTrue(self.call(tools.rename_room, {"room": "Kitchen", "new_name": "kitchen"})["renamed"])
+        self.assertEqual(len(FakeValetudo.calls), 1)
+
+    def test_rename_room_refusals_send_nothing(self):
+        cases = [
+            ({"new_name": "Hall"}, "exactly one of room or segment_id"),
+            ({"room": "Kitchen", "segment_id": "1", "new_name": "Hall"}, "exactly one"),
+            ({"room": "", "new_name": "Hall"}, "room must be a non-empty string"),
+            ({"segment_id": 10, "new_name": "Hall"}, "segment_id must be a non-empty string"),
+            ({"room": "Kitchen"}, "new_name must be a non-empty string"),
+            ({"room": "Kitchen", "new_name": "  "}, "new_name must be a non-empty string"),
+            ({"room": "Kitchen", "new_name": 5}, "new_name must be a non-empty string"),
+            ({"room": "Kitchen", "new_name": "x" * 33}, "32 characters or fewer"),
+            ({"room": "Kitchen", "new_name": "Hall\x00"}, "control characters"),
+            ({"room": "Garage", "new_name": "Hall"}, "Unknown room name"),
+            ({"room": "10", "new_name": "Hall"}, "Unknown room name"),  # an ID is not a name
+            ({"segment_id": "99", "new_name": "Hall"}, "Unknown segment ID"),
+            ({"room": "Kitchen", "new_name": "office"}, "Another room already has the name"),
+        ]
+        for args, text in cases:
+            with self.subTest(args=args):
+                self.assert_error(self.call(tools.rename_room, args), text)
+        FakeValetudo.routes[CAP] = [c for c in CAPABILITIES if c != "MapSegmentRenameCapability"]
+        tools._capability_cache.clear()
+        self.assert_error(self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"}),
+                          "MapSegmentRenameCapability")
+        self.assertEqual(FakeValetudo.calls, [])
+
+    def test_rename_room_robot_error(self):
+        FakeValetudo.put_status = 500
+        FakeValetudo.put_body = "Invalid name. Max length 23"
+        result = self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"})
+        self.assert_error(result, "HTTP 500 for PUT /robot/capabilities/MapSegmentRenameCapability: Invalid name")
 
     # --- control, presets, dock ---
 

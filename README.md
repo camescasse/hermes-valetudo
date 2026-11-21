@@ -11,6 +11,7 @@ This plugin is not affiliated with the Valetudo project.
 | `valetudo_status` | Read the status, robot error, battery, presets, dock state, consumables, current clean statistics and unread events |
 | `valetudo_rooms` | List the rooms (map segments) with their IDs and names |
 | `valetudo_clean_rooms` | Clean rooms by name or by segment ID, with 1 or more passes |
+| `valetudo_rename_room` | Rename one room. The robot does not move. |
 | `valetudo_control` | Start a full clean or continue a paused task, stop, pause, return to the dock or locate the robot |
 | `valetudo_set_preset` | Set the fan speed, water usage or operation mode, or list the allowed values |
 | `valetudo_dock` | Empty the dustbin, start or stop the mop wash, start or stop the mop drying |
@@ -21,12 +22,12 @@ Each tool first checks that the robot has the necessary Valetudo capability. A r
 
 The plugin calls a fixed set of endpoints only. It cannot:
 
-- reset or edit the map, or rename rooms
+- reset the map, or split or join rooms
 - change no-go zones or virtual walls
 - change Wi-Fi, MQTT or other Valetudo settings
 - turn off obstacle avoidance or other robot settings
 
-The plugin connects directly to the robot. It ignores proxy settings and does not follow HTTP redirects. It accepts only room names and segment IDs that the robot reports. It refuses presets and pass counts that the robot does not support.
+The plugin connects directly to the robot. It ignores proxy settings and does not follow HTTP redirects. It accepts only room names and segment IDs that the robot reports. It refuses a new room name that another room already has. It refuses presets and pass counts that the robot does not support.
 
 ## Install
 

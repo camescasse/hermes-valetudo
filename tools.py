@@ -1,7 +1,8 @@
 """Valetudo REST API client and tool handlers.
 
-The plugin calls only the endpoints in this file. It does not send map edits, no-go zones,
-Wi-Fi settings or other configuration changes to the robot. It does not follow redirects.
+The plugin calls only the endpoints in this file. The only map change that it can send is a room
+rename. It does not reset the map, split or join rooms, or send no-go zones, Wi-Fi settings or other
+configuration changes to the robot. It does not follow redirects.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ API = "/api/v2"
 TIMEOUT = 10
 CAPABILITY_TTL = 300
 MAX_ERROR_DETAIL = 200
+MAX_ROOM_NAME = 32
 
 PRESETS = {
     "fan_speed": "FanSpeedControlCapability",
@@ -372,6 +374,18 @@ def _iterations(args: dict, low: int, high: int) -> int:
     return value
 
 
+def _room_name(args: dict) -> str:
+    value = args.get("new_name")
+    if not isinstance(value, str) or not value.strip():
+        raise ValetudoError("new_name must be a non-empty string")
+    name = " ".join(value.split())
+    if len(name) > MAX_ROOM_NAME:
+        raise ValetudoError(f"new_name must have {MAX_ROOM_NAME} characters or fewer")
+    if not name.isprintable():
+        raise ValetudoError("new_name must not contain control characters")
+    return name
+
+
 # --- handlers ------------------------------------------------------------------------------
 
 
@@ -503,6 +517,33 @@ def _clean_rooms(args: dict) -> str:
     return _ok(started=True, rooms=[labels[i] for i in resolved], iterations=iterations)
 
 
+def _rename_room(args: dict) -> str:
+    targets = {key: args[key] for key in ("room", "segment_id") if args.get(key) is not None}
+    if len(targets) != 1:
+        raise ValetudoError("Give exactly one of room or segment_id")
+    key, target = next(iter(targets.items()))
+    if not isinstance(target, str) or not target.strip():
+        raise ValetudoError(f"{key} must be a non-empty string")
+    new_name = _room_name(args)
+    _require("MapSegmentRenameCapability")
+    segments = _segments()
+    if key == "room":
+        segment_id = _resolve_rooms([target.strip()], [], segments)[0]
+    else:
+        segment_id = _resolve_rooms([], [target.strip()], segments)[0]
+    old_name = next(s["name"] for s in segments if s["id"] == segment_id)
+    if any(s["id"] != segment_id and s["name"] and s["name"].casefold() == new_name.casefold() for s in segments):
+        raise ValetudoError(f"Another room already has the name '{new_name}'. Room names must be unique.")
+    if old_name == new_name:
+        return _ok(renamed=False, segment_id=segment_id, name=new_name)
+    _request(
+        "PUT",
+        _capability_path("MapSegmentRenameCapability"),
+        {"action": "rename_segment", "segment_id": segment_id, "name": new_name},
+    )
+    return _ok(renamed=True, segment_id=segment_id, old_name=old_name, new_name=new_name)
+
+
 def _control(args: dict) -> str:
     action = args.get("action")
     if action == "locate":
@@ -553,6 +594,10 @@ def rooms(args: dict, **kwargs) -> str:
 
 def clean_rooms(args: dict, **kwargs) -> str:
     return _run(_clean_rooms, args)
+
+
+def rename_room(args: dict, **kwargs) -> str:
+    return _run(_rename_room, args)
 
 
 def control(args: dict, **kwargs) -> str:
