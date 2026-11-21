@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -21,9 +22,12 @@ from agent.secret_scope import get_secret
 
 API = "/api/v2"
 TIMEOUT = 10
+# Some robots take more than 10 s to rename a room, for example the Midea E20.
+RENAME_TIMEOUT = 30
 CAPABILITY_TTL = 300
 MAX_ERROR_DETAIL = 200
-MAX_ROOM_NAME = 32
+# Valetudo on Roborock robots refuses names longer than 23 UTF-16 code units.
+MAX_ROOM_NAME = 23
 
 PRESETS = {
     "fan_speed": "FanSpeedControlCapability",
@@ -44,6 +48,9 @@ DOCK_ACTIONS = {
 
 _capability_cache: Dict[str, Tuple[float, List[str]]] = {}
 _cache_lock = threading.Lock()
+# One rename at a time: two parallel renames could give two rooms the same name.
+_rename_lock = threading.Lock()
+HOST_PATTERN = re.compile(r"[A-Za-z0-9._:%-]+")
 
 
 class ValetudoError(Exception):
@@ -76,6 +83,8 @@ def _base_url() -> str:
         )
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValetudoError("VALETUDO_URL must be an http:// or https:// URL")
+    if not HOST_PATTERN.fullmatch(parsed.hostname):
+        raise ValetudoError("VALETUDO_URL must use an IP address or an ASCII host name")
     try:
         parsed.hostname.encode("idna")
     except UnicodeError:
@@ -106,8 +115,9 @@ def _headers() -> Dict[str, str]:
 
 
 REDIRECT_CODES = {300, 301, 302, 303, 307, 308}
-# A proxy in front of Valetudo can return these after it sent the request to the robot.
-GATEWAY_CODES = {502, 504}
+# Valetudo returns 500 when the robot fails after it received the command, for example a
+# firmware timeout. A proxy can return 502 or 504 after it sent the request to the robot.
+UNCERTAIN_CODES = {500, 502, 504}
 # These errors occur after the connection opened, so the robot possibly received the request.
 SEND_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
@@ -125,14 +135,21 @@ def _opener() -> urllib.request.OpenerDirector:
 
 
 def _secrets_in(text: str) -> bool:
-    """Return True when text holds the credentials or the Authorization header."""
+    """Return True when text holds a credential, also in escaped form, or the Authorization header."""
     folded = text.casefold()
     if "authorization" in folded or "basic " in folded:
         return True
     user = get_secret("VALETUDO_USERNAME", "") or ""
     password = get_secret("VALETUDO_PASSWORD", "") or ""
     token = base64.b64encode(f"{user}:{password}".encode()).decode() if user or password else ""
-    return any(secret and secret in text for secret in (password, token))
+    for secret in (user, password, token):
+        if not secret:
+            continue
+        forms = {secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1],
+                 urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)}
+        if any(form.casefold() in folded for form in forms):
+            return True
+    return False
 
 
 def _error_detail(exc: urllib.error.HTTPError) -> str:
@@ -147,13 +164,21 @@ def _error_detail(exc: urllib.error.HTTPError) -> str:
     return ": " + " ".join(body.split())
 
 
-def _possibly_ran(method: str) -> str:
+def _possibly_ran(method: str, check: str) -> str:
     if method == "GET":
         return ""
-    return " The command possibly ran. Call valetudo_status before you send it again."
+    return f" The command possibly ran. Call {check} before you send it again."
 
 
-def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
+def _request(
+    method: str,
+    path: str,
+    body: Optional[dict] = None,
+    timeout: Optional[float] = None,
+    check: str = "valetudo_status",
+) -> Any:
+    """Send one request. check names the tool that shows if an uncertain command ran."""
+    timeout = TIMEOUT if timeout is None else timeout
     base = _base_url()
     headers = _headers()
     data = None
@@ -162,7 +187,7 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(base + API + path, data=data, headers=headers, method=method)
     try:
-        with _opener().open(request, timeout=TIMEOUT) as response:
+        with _opener().open(request, timeout=timeout) as response:
             raw = response.read()
             content_type = response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
@@ -177,34 +202,37 @@ def _request(method: str, path: str, body: Optional[dict] = None) -> Any:
             raise ValetudoError(
                 "Valetudo refused the credentials (HTTP 401). Set VALETUDO_USERNAME and VALETUDO_PASSWORD."
             ) from None
-        hint = _possibly_ran(method) if exc.code in GATEWAY_CODES else ""
-        raise ValetudoError(f"Valetudo returned HTTP {exc.code} for {method} {path}{_error_detail(exc)}{hint}") from None
+        hint = _possibly_ran(method, check) if exc.code in UNCERTAIN_CODES else ""
+        raise ValetudoError(f"Valetudo returned HTTP {exc.code} for {method} {path}{_error_detail(exc)}.{hint}") from None
     except urllib.error.URLError as exc:
         # urllib wraps the errors of the connect and send steps in URLError.
         if isinstance(exc.reason, SEND_ERRORS):
             raise ValetudoError(
-                f"Connection to Valetudo at {base} failed: {type(exc.reason).__name__}.{_possibly_ran(method)}"
+                f"Connection to Valetudo at {base} failed: {type(exc.reason).__name__}.{_possibly_ran(method, check)}"
             ) from None
         if isinstance(exc.reason, TimeoutError):
-            raise ValetudoError(f"Cannot reach Valetudo at {base}: no connection in {TIMEOUT} s") from None
+            # urllib gives the same error for a connect timeout and a send timeout.
+            raise ValetudoError(
+                f"Valetudo at {base} did not answer in {timeout} s.{_possibly_ran(method, check)}"
+            ) from None
         raise ValetudoError(f"Cannot reach Valetudo at {base}: {exc.reason}") from None
     except TimeoutError:
         # The request went out, but the response did not arrive.
-        raise ValetudoError(f"Valetudo at {base} did not answer in {TIMEOUT} s.{_possibly_ran(method)}") from None
+        raise ValetudoError(f"Valetudo at {base} did not answer in {timeout} s.{_possibly_ran(method, check)}") from None
     except (http.client.HTTPException, OSError) as exc:
         # The connection closed after the request was sent, so the robot possibly received it.
         raise ValetudoError(
-            f"Connection to Valetudo at {base} failed: {type(exc).__name__}.{_possibly_ran(method)}"
+            f"Connection to Valetudo at {base} failed: {type(exc).__name__}.{_possibly_ran(method, check)}"
         ) from None
-    if not raw:
-        return None
     text = raw.decode("utf-8", "replace")
-    if "html" in content_type.casefold() or text.lstrip().startswith("<"):
+    if "html" in content_type.casefold() or text.lstrip("\ufeff \t\r\n").startswith("<"):
         # For example a login page of a reverse proxy: the robot did not get the request.
         raise ValetudoError(
             f"VALETUDO_URL returned an HTML page for {method} {path}, not a Valetudo API response. "
             "Set VALETUDO_URL to the address of the Valetudo web interface."
         )
+    if not raw:
+        return None
     try:
         return json.loads(raw)
     except ValueError:
@@ -248,8 +276,8 @@ def _segments() -> List[dict]:
     for s in _get_list(_capability_path("MapSegmentationCapability")):
         if not isinstance(s, dict) or s.get("id") is None or isinstance(s["id"], bool) or not str(s["id"]).strip():
             continue
-        name = s.get("name")
-        out.append({"id": str(s["id"]).strip(), "name": name.strip() if isinstance(name, str) and name.strip() else None})
+        name = " ".join(s["name"].split()) if isinstance(s.get("name"), str) else ""
+        out.append({"id": str(s["id"]).strip(), "name": name or None})
     return out
 
 
@@ -312,12 +340,14 @@ def _items(data: Any, what: str) -> List[dict]:
 def _summarize_statistics(points: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for point in _items(points, "statistics"):
+        if not isinstance(point.get("type"), str):
+            raise ValetudoError("Valetudo returned unexpected statistics data")
         value = point.get("value")
         if point.get("type") == "time" and isinstance(value, (int, float)):
             out["duration_minutes"] = round(value / 60, 1)
         elif point.get("type") == "area" and isinstance(value, (int, float)):
             out["area_m2"] = round(value / 10000, 1)
-        elif isinstance(point.get("type"), str):
+        else:
             out[point["type"]] = value
     return out
 
@@ -325,8 +355,10 @@ def _summarize_statistics(points: Any) -> Dict[str, Any]:
 def _summarize_consumables(items: Any) -> List[dict]:
     out = []
     for item in _items(items, "consumable"):
-        remaining = item.get("remaining") if isinstance(item.get("remaining"), dict) else {}
-        name = item.get("type") if isinstance(item.get("type"), str) else "consumable"
+        remaining = item.get("remaining")
+        if not isinstance(item.get("type"), str) or not isinstance(remaining, dict) or "value" not in remaining:
+            raise ValetudoError("Valetudo returned unexpected consumable data")
+        name = item["type"]
         if isinstance(item.get("subType"), str) and item["subType"] != "none":
             name = f"{name}_{item['subType']}"
         out.append({"consumable": name, "remaining": remaining.get("value"), "unit": remaining.get("unit")})
@@ -379,10 +411,10 @@ def _room_name(args: dict) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValetudoError("new_name must be a non-empty string")
     name = " ".join(value.split())
-    if len(name) > MAX_ROOM_NAME:
+    if len(name.encode("utf-16-le")) // 2 > MAX_ROOM_NAME:
         raise ValetudoError(f"new_name must have {MAX_ROOM_NAME} characters or fewer")
     if not name.isprintable():
-        raise ValetudoError("new_name must not contain control characters")
+        raise ValetudoError("new_name must contain only printable characters")
     return name
 
 
@@ -455,11 +487,13 @@ def _iteration_range() -> Tuple[int, int]:
     props = _request("GET", _capability_path("MapSegmentationCapability", "/properties"))
     count = (props if isinstance(props, dict) else {}).get("iterationCount")
     count = count if isinstance(count, dict) else {}
-    low, high = _whole(count.get("min")), _whole(count.get("max"))
-    low = 1 if low is None else low
-    high = low if high is None else high
-    if low < 1 or high < low:
-        raise ValetudoError(f"The robot reports a pass range that is not valid ({low} to {high})")
+    raw_low, raw_high = count.get("min"), count.get("max")
+    low = 1 if raw_low is None else _whole(raw_low)
+    high = low if raw_high is None else _whole(raw_high)
+    if low is None or high is None or low < 1 or high < low:
+        raise ValetudoError(
+            f"The robot reports a pass range that is not valid ({json.dumps(raw_low)} to {json.dumps(raw_high)})"
+        )
     return low, high
 
 
@@ -472,14 +506,15 @@ def _rooms(args: dict) -> str:
     return _ok(rooms=segments, iterations={"min": low, "max": high})
 
 
-def _resolve_rooms(names: List[str], ids: List[str], segments: List[dict]) -> List[str]:
+def _resolve_rooms(names: List[str], ids: List[str], segments: List[dict], id_arg: str = "segment_ids") -> List[str]:
     known_ids = {s["id"] for s in segments}
     resolved: List[str] = []
     unknown: List[str] = []
     for name in names:
-        matches = [s["id"] for s in segments if s["name"] and s["name"].casefold() == name.casefold()]
+        key = " ".join(name.split()).casefold()
+        matches = [s["id"] for s in segments if s["name"] and s["name"].casefold() == key]
         if len(matches) > 1:
-            raise ValetudoError(f"More than one room has the name '{name}'. Use segment_ids.")
+            raise ValetudoError(f"More than one room has the name '{name}'. Use {id_arg}.")
         if not matches:
             unknown.append(name)
         elif matches[0] not in resolved:
@@ -518,29 +553,41 @@ def _clean_rooms(args: dict) -> str:
 
 
 def _rename_room(args: dict) -> str:
-    targets = {key: args[key] for key in ("room", "segment_id") if args.get(key) is not None}
+    # An empty string counts as not given, as for the value of valetudo_set_preset.
+    targets = {
+        key: args[key]
+        for key in ("room", "segment_id")
+        if args.get(key) is not None and not (isinstance(args[key], str) and not args[key].strip())
+    }
     if len(targets) != 1:
         raise ValetudoError("Give exactly one of room or segment_id")
     key, target = next(iter(targets.items()))
-    if not isinstance(target, str) or not target.strip():
+    if not isinstance(target, str):
         raise ValetudoError(f"{key} must be a non-empty string")
     new_name = _room_name(args)
     _require("MapSegmentRenameCapability")
-    segments = _segments()
-    if key == "room":
-        segment_id = _resolve_rooms([target.strip()], [], segments)[0]
-    else:
-        segment_id = _resolve_rooms([], [target.strip()], segments)[0]
-    old_name = next(s["name"] for s in segments if s["id"] == segment_id)
-    if any(s["id"] != segment_id and s["name"] and s["name"].casefold() == new_name.casefold() for s in segments):
-        raise ValetudoError(f"Another room already has the name '{new_name}'. Room names must be unique.")
-    if old_name == new_name:
-        return _ok(renamed=False, segment_id=segment_id, name=new_name)
-    _request(
-        "PUT",
-        _capability_path("MapSegmentRenameCapability"),
-        {"action": "rename_segment", "segment_id": segment_id, "name": new_name},
-    )
+    with _rename_lock:
+        status = _summarize_attributes(_get_list("/robot/state/attributes")).get("status")
+        if status != "docked":
+            # The Valetudo web interface also permits a rename only when the robot is docked.
+            raise ValetudoError(f"The robot must be docked to rename a room. The status now is {status}.")
+        segments = _segments()
+        if key == "room":
+            segment_id = _resolve_rooms([target], [], segments, id_arg="segment_id")[0]
+        else:
+            segment_id = _resolve_rooms([], [target.strip()], segments, id_arg="segment_id")[0]
+        old_name = next(s["name"] for s in segments if s["id"] == segment_id)
+        if any(s["id"] != segment_id and s["name"] and s["name"].casefold() == new_name.casefold() for s in segments):
+            raise ValetudoError(f"Another room already has the name '{new_name}'. Room names must be unique.")
+        if old_name == new_name:
+            return _ok(renamed=False, segment_id=segment_id, name=new_name)
+        _request(
+            "PUT",
+            _capability_path("MapSegmentRenameCapability"),
+            {"action": "rename_segment", "segment_id": segment_id, "name": new_name},
+            timeout=RENAME_TIMEOUT,
+            check="valetudo_rooms",
+        )
     return _ok(renamed=True, segment_id=segment_id, old_name=old_name, new_name=new_name)
 
 

@@ -11,7 +11,7 @@ This plugin is not affiliated with the Valetudo project.
 | `valetudo_status` | Read the status, robot error, battery, presets, dock state, consumables, current clean statistics and unread events |
 | `valetudo_rooms` | List the rooms (map segments) with their IDs and names |
 | `valetudo_clean_rooms` | Clean rooms by name or by segment ID, with 1 or more passes |
-| `valetudo_rename_room` | Rename one room. The robot does not move. |
+| `valetudo_rename_room` | Rename one room when the robot is docked. The robot does not move. |
 | `valetudo_control` | Start a full clean or continue a paused task, stop, pause, return to the dock or locate the robot |
 | `valetudo_set_preset` | Set the fan speed, water usage or operation mode, or list the allowed values |
 | `valetudo_dock` | Empty the dustbin, start or stop the mop wash, start or stop the mop drying |
@@ -60,7 +60,7 @@ The plugin uses only the Python standard library.
 ## Disclosure
 
 - **Network:** the plugin sends HTTP requests only to `VALETUDO_URL`. It connects directly and ignores `http_proxy` and `https_proxy`. It does not follow redirects. It sends no telemetry.
-- **Physical device:** the tools move a robot in your home. Hermes calls them with no confirmation step.
+- **Physical device:** the tools move a robot in your home and change its room names. Hermes calls them with no confirmation step.
 - **Credentials:** the plugin reads `VALETUDO_URL`, `VALETUDO_USERNAME` and `VALETUDO_PASSWORD` through Hermes. It stores nothing.
 - **Clear text:** Valetudo serves plain `http://`. Basic auth over `http://` sends the password unencrypted on your network.
 - **Model provider:** tool results go to your model provider. They contain room names, robot state and, in error messages, the `VALETUDO_URL` address.

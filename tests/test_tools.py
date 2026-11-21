@@ -135,7 +135,8 @@ class FakeValetudo(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._send(401, "Unauthorized")
         length = int(self.headers.get("Content-Length", 0))
-        FakeValetudo.calls.append((self.path, json.loads(self.rfile.read(length) or b"null")))
+        body = json.loads(self.rfile.read(length) or b"null")
+        FakeValetudo.calls.append((self.path, body))
         if FakeValetudo.put_drop:
             self.close_connection = True
             self.connection.shutdown(2)
@@ -144,6 +145,10 @@ class FakeValetudo(BaseHTTPRequestHandler):
             time.sleep(FakeValetudo.put_delay)
         if FakeValetudo.put_status != 200:
             return self._send(FakeValetudo.put_status, FakeValetudo.put_body, FakeValetudo.put_headers)
+        if self.path.endswith("/MapSegmentRenameCapability"):
+            for segment in FakeValetudo.routes[f"{CAP}/MapSegmentationCapability"]:
+                if segment.get("id") == body["segment_id"]:
+                    segment["name"] = body["name"]
         self._send(200, FakeValetudo.put_ok_body, FakeValetudo.put_headers)
 
 
@@ -202,7 +207,7 @@ class ToolTests(unittest.TestCase):
         for raw in ("192.168.1.5", "http://192.168.1.5/", "http://192.168.1.5/api/v2"):
             SECRETS["VALETUDO_URL"] = raw
             self.assertEqual(tools._base_url(), "http://192.168.1.5")
-        for raw in ("ftp://x", "http://host:port", "http://a..b"):
+        for raw in ("ftp://x", "http://host:port", "http://a..b", "http://робот.local", "http://my host"):
             SECRETS["VALETUDO_URL"] = raw
             self.assertRaises(tools.ValetudoError, tools._base_url)
 
@@ -256,9 +261,16 @@ class ToolTests(unittest.TestCase):
         result = self.call(tools.status)
         self.assertTrue(result["ok"])
         self.assertEqual(result["state"]["status"], "docked")
-        self.assertEqual(result["consumables"], [{"consumable": "brush", "remaining": None, "unit": None}])
+        self.assertIn("unexpected consumable data", result["consumables_problem"])
         self.assertIn("unexpected response", result["current_statistics_problem"])
         self.assertIn("unexpected event data", result["unread_events_problem"])
+
+    def test_status_empty_records_are_problems(self):
+        FakeValetudo.routes[f"{CAP}/CurrentStatisticsCapability"] = [{}]
+        FakeValetudo.routes[f"{CAP}/ConsumableMonitoringCapability"] = [{}]
+        result = self.call(tools.status)
+        self.assertIn("unexpected statistics data", result["current_statistics_problem"])
+        self.assertIn("unexpected consumable data", result["consumables_problem"])
 
     def test_status_bad_items_are_problems_not_empty_lists(self):
         FakeValetudo.routes["/api/v2/events"] = {"error": "service unavailable"}
@@ -329,13 +341,18 @@ class ToolTests(unittest.TestCase):
 
     def test_iteration_range_fallback(self):
         props = f"{CAP}/MapSegmentationCapability/properties"
-        for value in ({}, {"iterationCount": "x"}, {"iterationCount": {"min": True, "max": "3"}}, []):
+        for value in ({}, {"iterationCount": "x"}, {"iterationCount": {"max": None}}, []):
             with self.subTest(value=value):
                 FakeValetudo.routes[props] = value
                 self.assertEqual(self.call(tools.rooms)["iterations"], {"min": 1, "max": 1})
 
     def test_invalid_iteration_range_sends_nothing(self):
-        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability/properties"] = {"iterationCount": {"min": 2, "max": 1}}
+        props = f"{CAP}/MapSegmentationCapability/properties"
+        for count in ({"min": 1.5, "max": 3}, {"min": True, "max": 3}, {"min": 1, "max": "3"}, {"min": 0, "max": 3}):
+            with self.subTest(count=count):
+                FakeValetudo.routes[props] = {"iterationCount": count}
+                self.assert_error(self.call(tools.clean_rooms, {"rooms": ["Kitchen"]}), "not valid")
+        FakeValetudo.routes[props] = {"iterationCount": {"min": 2, "max": 1}}
         self.assert_error(self.call(tools.clean_rooms, {"rooms": ["Kitchen"]}), "not valid (2 to 1)")
         result = self.call(tools.rooms)
         self.assertEqual(len(result["rooms"]), 3)
@@ -402,13 +419,16 @@ class ToolTests(unittest.TestCase):
         cases = [
             ({"new_name": "Hall"}, "exactly one of room or segment_id"),
             ({"room": "Kitchen", "segment_id": "1", "new_name": "Hall"}, "exactly one"),
-            ({"room": "", "new_name": "Hall"}, "room must be a non-empty string"),
+            ({"room": "", "new_name": "Hall"}, "exactly one"),
+            ({"room": None, "segment_id": "", "new_name": "Hall"}, "exactly one"),
             ({"segment_id": 10, "new_name": "Hall"}, "segment_id must be a non-empty string"),
             ({"room": "Kitchen"}, "new_name must be a non-empty string"),
             ({"room": "Kitchen", "new_name": "  "}, "new_name must be a non-empty string"),
             ({"room": "Kitchen", "new_name": 5}, "new_name must be a non-empty string"),
-            ({"room": "Kitchen", "new_name": "x" * 33}, "32 characters or fewer"),
-            ({"room": "Kitchen", "new_name": "Hall\x00"}, "control characters"),
+            ({"room": "Kitchen", "new_name": "x" * 24}, "23 characters or fewer"),
+            ({"room": "Kitchen", "new_name": "x" * 22 + "😀"}, "23 characters or fewer"),  # 2 UTF-16 units
+            ({"room": "Kitchen", "new_name": "Hall\x00"}, "printable characters"),
+            ({"room": 5, "new_name": "Hall"}, "room must be a non-empty string"),
             ({"room": "Garage", "new_name": "Hall"}, "Unknown room name"),
             ({"room": "10", "new_name": "Hall"}, "Unknown room name"),  # an ID is not a name
             ({"segment_id": "99", "new_name": "Hall"}, "Unknown segment ID"),
@@ -425,9 +445,58 @@ class ToolTests(unittest.TestCase):
 
     def test_rename_room_robot_error(self):
         FakeValetudo.put_status = 500
-        FakeValetudo.put_body = "Invalid name. Max length 23"
+        FakeValetudo.put_body = json.dumps("Invalid name. Max length 23")  # Valetudo sends a JSON string
         result = self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"})
-        self.assert_error(result, "HTTP 500 for PUT /robot/capabilities/MapSegmentRenameCapability: Invalid name")
+        self.assert_error(result, 'HTTP 500 for PUT /robot/capabilities/MapSegmentRenameCapability: "Invalid name')
+        self.assertIn("Call valetudo_rooms", result["error"])
+
+    def test_rename_room_uncertain_results_name_valetudo_rooms(self):
+        FakeValetudo.put_status = 504
+        self.assertIn("Call valetudo_rooms", self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"})["error"])
+        FakeValetudo.put_status = 200
+        FakeValetudo.put_delay = 0.6
+        tools.TIMEOUT = 0.3  # the rename has its own, longer timeout
+        self.assertTrue(self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"})["ok"])
+        saved = tools.RENAME_TIMEOUT
+        tools.RENAME_TIMEOUT = 0.3
+        try:
+            result = self.call(tools.rename_room, {"room": "Hall", "new_name": "Big hall"})
+        finally:
+            tools.RENAME_TIMEOUT = saved
+        self.assert_error(result, "did not answer in 0.3 s")
+        self.assertIn("Call valetudo_rooms", result["error"])
+
+    def test_rename_room_needs_docked_robot(self):
+        FakeValetudo.routes["/api/v2/robot/state/attributes"][0]["value"] = "cleaning"
+        self.assert_error(self.call(tools.rename_room, {"room": "Kitchen", "new_name": "Hall"}),
+                          "must be docked to rename a room. The status now is cleaning")
+        self.assertEqual(FakeValetudo.calls, [])
+
+    def test_rename_room_selectors(self):
+        result = self.call(tools.rename_room, {"room": None, "segment_id": "1", "new_name": "Hall"})
+        self.assertEqual((result["segment_id"], result["old_name"]), ("1", "Kitchen"))
+        result = self.call(tools.rename_room, {"room": "  hall ", "segment_id": "", "new_name": "Big hall"})
+        self.assertEqual((result["segment_id"], result["old_name"]), ("1", "Hall"))
+
+    def test_rename_room_compares_collapsed_names(self):
+        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability"].append({"id": "3", "name": "Living  room"})
+        self.assertIn({"id": "3", "name": "Living room"}, self.call(tools.rooms)["rooms"])
+        self.assert_error(self.call(tools.rename_room, {"room": "Kitchen", "new_name": "living room"}), "Another room")
+        FakeValetudo.routes[f"{CAP}/MapSegmentationCapability"].append({"id": "4", "name": "office"})
+        self.assert_error(self.call(tools.rename_room, {"room": "Office", "new_name": "Hall"}), "Use segment_id.")
+        self.assertEqual(FakeValetudo.calls, [])
+
+    def test_parallel_renames_do_not_give_one_name_twice(self):
+        FakeValetudo.put_delay = 0.3
+        results = []
+        threads = [threading.Thread(target=lambda sid=sid: results.append(
+            self.call(tools.rename_room, {"segment_id": sid, "new_name": "Hall"}))) for sid in ("1", "2")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(r["ok"] for r in results), [False, True])
+        self.assertEqual(len(FakeValetudo.calls), 1)
 
     # --- control, presets, dock ---
 
@@ -537,17 +606,23 @@ class ToolTests(unittest.TestCase):
         FakeValetudo.routes[CAP] = ["BasicControlCapability", "LocateCapability"]
         FakeValetudo.routes["/api/v2/robot/state/attributes"] = None  # the fake server answers with an HTML 404 page
         result = self.call(tools.status)
-        self.assertTrue(result["error"].endswith("HTTP 404 for GET /robot/state/attributes"), result)
+        self.assertTrue(result["error"].endswith("HTTP 404 for GET /robot/state/attributes."), result)
 
     def test_error_body_with_credentials_is_dropped(self):
         SECRETS.update(VALETUDO_USERNAME="user", VALETUDO_PASSWORD="s3cret")
         token = base64.b64encode(b"user:s3cret").decode()
         FakeValetudo.put_status = 403
-        for body in (f"Basic {token}", f"authorization: {token}", f"bad {token}", "password s3cret refused"):
+        SECRETS["VALETUDO_PASSWORD"] = 's3cr"et'
+        FakeValetudo.put_body = json.dumps({"error": 'bad password s3cr"et'})
+        self.assertNotIn("s3cr", json.dumps(self.call(tools.control, {"action": "home"})))
+        SECRETS["VALETUDO_PASSWORD"] = "s3cret"
+        FakeValetudo.put_status = 403
+        for body in (f"Basic {token}", f"authorization: {token}", f"bad {token}", "password s3cret refused",
+                     "User USER is not allowed"):
             with self.subTest(body=body):
                 FakeValetudo.put_body = body
                 result = self.call(tools.control, {"action": "home"})
-                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability"), result)
+                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability."), result)
                 self.assertNotIn("s3cret", json.dumps(result))
                 self.assertNotIn(token, json.dumps(result))
 
@@ -557,7 +632,7 @@ class ToolTests(unittest.TestCase):
             with self.subTest(body=body[:20]):
                 FakeValetudo.put_body = body
                 result = self.call(tools.control, {"action": "home"})
-                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability"), result)
+                self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability."), result)
         FakeValetudo.put_body = "é" * 150
         self.assertIn("é" * 150, self.call(tools.control, {"action": "home"})["error"])
 
@@ -580,16 +655,22 @@ class ToolTests(unittest.TestCase):
         FakeValetudo.put_ok_body = "Login"
         FakeValetudo.put_headers = {"Content-Type": "text/html; charset=utf-8"}
         self.assert_error(self.call(tools.control, {"action": "home"}), "HTML page")
+        FakeValetudo.put_ok_body = ""
+        self.assert_error(self.call(tools.control, {"action": "home"}), "HTML page")  # empty HTML body
+        FakeValetudo.put_headers = {}
+        FakeValetudo.put_ok_body = "\ufeff<html>login</html>"
+        self.assert_error(self.call(tools.control, {"action": "home"}), "HTML page")
         FakeValetudo.routes[CAP] = (200, "<html>Login</html>", None)
         tools._capability_cache.clear()
         self.assert_error(self.call(tools.status), "HTML page")
 
-    def test_gateway_error_on_put_says_state_is_unknown(self):
-        for code in (502, 504):
+    def test_uncertain_http_error_on_put_says_state_is_unknown(self):
+        for code in (500, 502, 504):
             with self.subTest(code=code):
                 FakeValetudo.put_status = code
-                self.assert_error(self.call(tools.control, {"action": "home"}), "possibly ran")
-        FakeValetudo.put_status = 500
+                self.assert_error(self.call(tools.control, {"action": "home"}),
+                                  "Invalid request body. The command possibly ran. Call valetudo_status")
+        FakeValetudo.put_status = 503
         self.assertNotIn("possibly ran", self.call(tools.control, {"action": "home"})["error"])
 
     def test_send_error_says_state_is_unknown(self):
@@ -598,9 +679,12 @@ class ToolTests(unittest.TestCase):
         failing.open.side_effect = urllib.error.URLError(BrokenPipeError(32, "Broken pipe"))
         with mock.patch.object(tools, "_opener", return_value=failing):
             self.assert_error(self.call(tools.control, {"action": "home"}), "possibly ran")
+            # urllib gives the same error for a connect timeout and a send timeout.
             failing.open.side_effect = urllib.error.URLError(TimeoutError("timed out"))
+            self.assert_error(self.call(tools.control, {"action": "home"}), "possibly ran")
+            failing.open.side_effect = urllib.error.URLError(ConnectionRefusedError(111, "refused"))
             result = self.call(tools.control, {"action": "home"})
-            self.assert_error(result, "no connection in")
+            self.assert_error(result, "Cannot reach")
             self.assertNotIn("possibly ran", result["error"])
 
     def test_put_timeout_says_state_is_unknown(self):
@@ -623,7 +707,7 @@ class ToolTests(unittest.TestCase):
         FakeValetudo.put_status = 400
         FakeValetudo.put_body = "x" * 500
         result = self.call(tools.control, {"action": "home"})
-        self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability"), result)
+        self.assertTrue(result["error"].endswith("PUT /robot/capabilities/BasicControlCapability."), result)
 
     def test_unreachable(self):
         SECRETS["VALETUDO_URL"] = "http://127.0.0.1:9"
