@@ -1,4 +1,4 @@
-# Valetudo Robot Control for Hermes Agent
+# Cloudless Vacuum for Hermes Agent
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that controls a robot vacuum that runs [Valetudo](https://valetudo.cloud). It uses the Valetudo REST API on your local network. It needs no Home Assistant, no MQTT and no cloud account.
 
@@ -32,8 +32,8 @@ The plugin connects directly to the robot. It ignores proxy settings and does no
 ## Install
 
 ```sh
-hermes plugins install valetudo
-hermes plugins enable valetudo
+hermes plugins install cloudless-vacuum
+hermes plugins enable cloudless-vacuum
 ```
 
 The installer asks for `VALETUDO_URL`. Use the address of the Valetudo web interface, for example `http://192.168.1.50`. Do not put a username or password in the URL.
@@ -45,7 +45,7 @@ VALETUDO_USERNAME=<username>
 VALETUDO_PASSWORD=<password>
 ```
 
-In the Hermes Desktop app, you can also set them in Settings → Plugins → Valetudo Robot Control.
+In the Hermes Desktop app, you can also set them in Settings → Plugins → Cloudless Vacuum.
 
 Start a new Hermes session. Then ask, for example, "Clean the kitchen and the office twice".
 

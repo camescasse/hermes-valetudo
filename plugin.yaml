@@ -1,11 +1,11 @@
-name: valetudo
-label: Valetudo Robot Control
-version: 0.1.1
+name: cloudless-vacuum
+label: Cloudless Vacuum
+version: 0.2.0
 manifest_version: 2
 api_version: 1
 author: camescasse
 license: MIT
-homepage: https://github.com/camescasse/hermes-valetudo
+homepage: https://github.com/camescasse/hermes-cloudless-vacuum
 tags: [valetudo, robot-vacuum, smart-home]
 description: >
   Control a robot vacuum that runs Valetudo, through its local REST API.
@@ -13,6 +13,7 @@ description: >
   pause, dock or locate the robot, set the fan, water and mode presets,
   and start dock actions. The plugin calls a fixed set of endpoints only:
   it cannot reset the map, edit no-go zones or change Wi-Fi settings.
+  Not affiliated with the Valetudo project.
 requires_hermes: ">=0.22.6"
 provides_tools:
   - valetudo_status

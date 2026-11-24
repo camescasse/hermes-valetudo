@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600">
+  <rect width="1200" height="600" fill="#0f1720"/>
+  <g transform="translate(600 300) scale(0.9) translate(-652 -305)">
+  <!-- robot vacuum, top view -->
+  <g transform="translate(560 320)">
+    <circle r="190" fill="#1c2733" stroke="#e2e8f0" stroke-width="14"/>
+    <path d="M -150 -112 A 188 188 0 0 1 150 -112" fill="none" stroke="#2dd4bf" stroke-width="22" stroke-linecap="round"/>
+    <circle r="132" fill="none" stroke="#334155" stroke-width="6"/>
+    <circle cy="-62" r="44" fill="#e2e8f0"/>
+    <circle cy="-62" r="18" fill="#1c2733"/>
+    <rect x="-46" y="40" width="92" height="24" rx="12" fill="#334155"/>
+    <circle cx="-22" cy="52" r="7" fill="#2dd4bf"/>
+    <circle cx="22" cy="52" r="7" fill="#e2e8f0"/>
+  </g>
+  <!-- crossed-out cloud -->
+  <g transform="translate(820 170)">
+    <g fill="#0f1720" stroke="#0f1720" stroke-width="44" stroke-linejoin="round">
+      <circle cx="-50" cy="12" r="42"/><circle cx="8" cy="-18" r="58"/><circle cx="62" cy="16" r="38"/>
+      <rect x="-50" y="12" width="112" height="42"/>
+    </g>
+    <g fill="#94a3b8">
+      <circle cx="-50" cy="12" r="42"/><circle cx="8" cy="-18" r="58"/><circle cx="62" cy="16" r="38"/>
+      <rect x="-50" y="12" width="112" height="42"/>
+    </g>
+    <line x1="-100" y1="-80" x2="110" y2="90" stroke="#0f1720" stroke-width="34" stroke-linecap="round"/>
+    <line x1="-100" y1="-80" x2="110" y2="90" stroke="#f87171" stroke-width="16" stroke-linecap="round"/>
+  </g>
+  </g>
+</svg>

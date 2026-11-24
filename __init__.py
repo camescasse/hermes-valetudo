@@ -1,4 +1,4 @@
-"""Valetudo plugin for Hermes Agent: control a Valetudo robot vacuum over its local REST API."""
+"""Cloudless Vacuum plugin for Hermes Agent: control a robot vacuum that runs Valetudo, over its local REST API."""
 
 from __future__ import annotations
 
